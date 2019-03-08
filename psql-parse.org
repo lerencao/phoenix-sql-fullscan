@@ -1,0 +1,298 @@
+* Slide Options                           :noexport:
+#+TITLE: Phoenix SQL 全表扫描检查
+#+SUBTITLE: A Harder Way
+#+AUTHOR: 长扬
+#+COMPANY: wacai
+
+# ======= Appear in thank-you-slide ================
+#+GITHUB: http://github.com/lerencao
+#+TWITTER: lerencao
+
+# ======= Appear under each slide ==================
+#+FAVICON: images/emacs-icon.png
+#+ICON: images/org-icon.png
+
+# ======= Google Analytics =========================
+#+ANALYTICS: UA-000000000-0
+
+# ======= Org settings =========================
+#+EXCLUDE_TAGS: noexport
+#+OPTIONS: toc:nil num:nil
+
+
+* 基础
+  :PROPERTIES:
+  :SLIDE:    segue dark quote
+  :ASIDE:    right bottom
+  :ARTICLE:  flexbox vleft auto-fadein
+  :END:
+
+** HBase
+   :PROPERTIES:
+   :ARTICLE:  larger
+   :END:
+   - 维度为 *4* 的 KV 数据库。
+     - rowKey
+     - columnFamily
+     - columnName
+     - timestamp | version
+
+
+| rowKey | columnFamily.columnName | version |
+|--------+-------------------------+---------|
+| a      | *info.name*             |      11 |
+| b      | *info.age*              |      22 |
+| c      | *info.gender*           |      33 |
+|--------+-------------------------+---------|
+
+
+** Phoenix
+
+
+
+#+BEGIN_QUOTE
+We put the SQL back in NoSQL
+   -- Phoenix
+#+END_QUOTE
+
+
+*** Phoenix Table
+
+#+BEGIN_SRC sql
+create table if not exists test.user (
+  my_pk varchar(50) not null,
+  info.name varchar(128),
+  info.gender integer,
+  info.nickname varchar(128),
+  info.age integer,
+  info.phone varchar(32),
+  edu.highschool varchar(256),
+  edu.college varchar(256),
+  constraint pk primary key (my_pk)
+)
+#+END_SRC
+
+- primary key 构成 rowKey
+- column 由 columnFamily 和 columnName 构成
+- timestamp，由 Phoenix 生成，或者自己指定列
+
+*** Phoenix Index
+
+#+BEGIN_SRC sql
+create index if not exists user_name_index on test.user(
+  info.name desc,
+  info.nickname desc
+) include (age, phone)
+#+END_SRC
+
+#+BEGIN_SRC scala
+val rowKey = s"${info.name}#${info.nickname}#${my_pk}"
+val column1 = s"$age"
+val column2 = s"$phone"
+#+END_SRC
+
+- rowKey 由 索引+PK 构成。
+- 额外会生成多余的 columns 来保存 involved columns。
+
+
+* 问题
+  :PROPERTIES:
+  :ARTICLE:  large
+  :END:
+
+  #+BEGIN_CENTER
+  过滤（可能）含有 *全表扫描* 的 PSQL 查询
+  #+END_CENTER
+
+* 分析
+  :PROPERTIES:
+  :SLIDE:    segue dark quote
+  :ASIDE:    right bottom
+  :ARTICLE:  flexbox vleft auto-fadein
+  :END:
+
+
+** 基于主键的查询
+
+#+BEGIN_SRC sql
+create table if not exists test.user (
+  my_pk varchar(50) not null,
+  info.name varchar(128),
+  info.gender integer,
+  info.nickname varchar(128),
+  info.age integer,
+  info.phone varchar(32),
+  edu.highschool varchar(256),
+  edu.college varchar(256),
+  constraint pk primary key (my_pk)
+);
+#+END_SRC
+
+#+BEGIN_SRC sql
+select * from test.user where my_pk like 'asdf%';
+select phone from test.user where gender = 0;
+select highschool from test.user where age > 18;
+select highschool from test.user where my_pk like 'asdf%' and age < 18;
+#+END_SRC
+
+** 基于索引的查询
+
+#+BEGIN_SRC sql
+create index if not exists user_name_index on test.user(
+  info.name desc,
+  info.nickname desc
+) include (age, phone)
+#+END_SRC
+
+
+#+BEGIN_SRC sql
+select age from test.user where name like 'asdf%';
+select * from test.user where name like "asdf%";
+select college from test.user where name like "asdf%";
+select name from test.user where nickname like "asdf%";
+#+END_SRC
+
+** 条件语句
+
+#+BEGIN_SRC sql
+
+(name = "asdfasdf")
+(nickname like "fdsa%")
+(my_pk in ('changyang', 'changyang1'))
+(my_pk not in ('changyang', 'changyang1'))
+(info.age < 18)
+(length(name) % 2 = 1)
+
+# 组合
+(name = "asdfasdf" and nickname like "fdsa%")
+(name = "asdfasdf" or nickname like "fdsa%")
+(my_pk in ('changyang', 'changyang1')) and (info.age < 18)
+(my_pk not in ('changyang', 'changyang1')) and (info.age < 18)
+(length(name) % 2 = 1) and (nickname like "fdsa%")
+
+#+END_SRC
+
+
+#+BEGIN_CENTER
+*逻辑运算： TRUE, FALSE, AND, OR, NOT*
+#+END_CENTER
+
+
+** End of story
+   # :PROPERTIES:
+   # :ARTICLE:  smaller
+   # :END:
+#+BEGIN_CENTER
+*master column: primary key 或者 index 的第一列*
+#+END_CENTER
+
+
+1. Where 子句应该可以 *被某一个 MC 覆盖* ：
+  - 如果是 And 形式，那么需要至少一个 and 子句可以 *被 MC 覆盖*
+  - 如果是 Or 形式，那么需要所有的 or 子句都可以 *被 MC 覆盖*
+  - 如果是 Not 形式（包括 not in, not null 等等），或者包含加减乘除，函数调用，那么这个条件无法 *被 MC 覆盖*
+  - 其他 trival 形式， columnName 是 master column 的，可以 *被 MC 覆盖*
+    - pk = "sdf"
+    - name like "sdf%"
+    - pk in ("abads", "sfdsfv")
+
+** End of story
+
+1. [@2] 当 Where 能被某一个 master column 覆盖，且 master column  是索引时，需要判断是否符合如下条件：
+  - where 条件只能使用索引中出现的 columns 和 pk
+  - select 出来的内容只能是索引中出现的 columns 和 pk
+
+* 实现
+  :PROPERTIES:
+  :SLIDE:    segue dark quote
+  :ASIDE:    right bottom
+  :ARTICLE:  flexbox vleft auto-fadein
+  :END:
+
+** Phoenix SQL 的解析
+
+1. =, > <, <=, >=, !=
+2. LIKE, ILIKE
+3. IS NULL
+4. IN LIST
+5. IN SUBQUERY
+6. EXISTS
+7. BETWEEN
+8. AND
+9. OR
+10. NOT
+
+** Phoenix SQL 的解析
+   :PROPERTIES:
+   :ARTICLE:  smaller
+   :END:
+
+#+BEGIN_SRC
+ParseNode (org.apache.phoenix.parse)
+  - TerminalParseNode (org.apache.phoenix.parse)
+    - WildcardParseNode (org.apache.phoenix.parse)
+    - SubqueryParseNode (org.apache.phoenix.parse)
+    - NamedParseNode (org.apache.phoenix.parse)
+    - LiteralParseNode (org.apache.phoenix.parse)
+    - SequenceValueParseNode (org.apache.phoenix.parse)
+  - CompoundParseNode (org.apache.phoenix.parse)
+    - ArrayAllAnyComparisonNode (org.apache.phoenix.parse)
+    - ArithmeticParseNode (org.apache.phoenix.parse)
+    - InListParseNode (org.apache.phoenix.parse)
+    - FunctionParseNode (org.apache.phoenix.parse)
+    - ArrayConstructorNode (org.apache.phoenix.parse)
+    - AndParseNode (org.apache.phoenix.parse)
+    - BinaryParseNode (org.apache.phoenix.parse)
+    - UnaryParseNode (org.apache.phoenix.parse)
+    - OrParseNode (org.apache.phoenix.parse)
+    - BetweenParseNode (org.apache.phoenix.parse)
+    - CaseParseNode (org.apache.phoenix.parse)
+    - ArrayElemRefNode (org.apache.phoenix.parse)
+    - RowValueConstructorParseNode (org.apache.phoenix.parse)
+    - StringConcatParseNode (org.apache.phoenix.parse)
+#+END_SRC
+
+
+*** Parse Tree 剪枝
+   :PROPERTIES:
+   :ARTICLE:  smaller
+   :END:
+
+#+BEGIN_SRC java
+    static Node handleCondition(ParseNode condition, List<SelectObject> selectObjects) throws SQLException {
+        if (condition instanceof InListParseNode) { // 处理 case 4
+            return handleInList((InListParseNode) condition);
+        } else if (condition instanceof AndParseNode) { // 处理 case 8
+            return handleAnd(((AndParseNode) condition), selectObjects);
+        } else if (condition instanceof LikeParseNode) { // 处理 case 2
+            return handleLike(((LikeParseNode) condition));
+        } else if (condition instanceof InParseNode) { // 处理 case 5
+            return handleInSubQuery((InParseNode) condition, selectObjects);
+        } else if (condition instanceof ComparisonParseNode) { // 处理 case 1
+            return handleComparison(((ComparisonParseNode) condition));
+        } else if (condition instanceof NotParseNode) { // 处理 case 10
+            return handleNot((NotParseNode) condition);
+        } else if (condition instanceof ExistsParseNode) { // 处理 case 6
+            return handleExists(((ExistsParseNode) condition));
+        } else if (condition instanceof IsNullParseNode) { // 处理 case 3
+            return handleIsNull((IsNullParseNode) condition);
+        } else if (condition instanceof OrParseNode) {  // 处理 9
+            return handleOr((OrParseNode) condition, selectObjects);
+            // 拿到所有子节点的 column 信息
+        } else if (condition instanceof BetweenParseNode) { // 处理 7
+            return handleBetween((BetweenParseNode) condition);
+        } else {
+            throw new IllegalStateException("非法的 SQL 节点");
+        }
+    }
+#+END_SRC
+
+
+
+** THANK YOU!
+   :PROPERTIES:
+   :SLIDE:    thank-you-slide segue
+   :ASIDE:    right
+   :ARTICLE:  flexbox vleft auto-fadein
+   :END:
+
